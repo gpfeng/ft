@@ -9,6 +9,7 @@ import (
     "os"
     "flag"
     "bufio"
+    "path"
     "strings"
     "sync"
     "net"
@@ -16,20 +17,25 @@ import (
     "./util"
 )
 
-func ParseParams() (host string, port int, files []string) {
-    h := flag.String("h", "127.0.0.1", "host name or ip address")
+func ParseParams() (host string, port int, help, compressed bool, files []string) {
+    H := flag.String("H", "127.0.0.1", "host name or ip address")
     p := flag.Int("p", 12345, "host port")
+    c := flag.Bool("c", false, "compress or not")
+    h := flag.Bool("h", false, "print help information")
+
     flag.Parse()
 
-    host = *h
+    host = *H
     port = *p
+    compressed = *c
+    help = *h
     files = flag.Args()
 
     return
 }
 
 // server will send only one message to client
-func ReceiveRespone(conn net.Conn, filename string, end *bool, wg *sync.WaitGroup) {
+func ReceiveResponse(conn net.Conn, filename string, end *bool, wg *sync.WaitGroup) {
     defer wg.Done()
     buf := make([]byte, util.MAX_RESPONSE_SIZE)
     l, err := conn.Read(buf)
@@ -54,13 +60,19 @@ func ReceiveRespone(conn net.Conn, filename string, end *bool, wg *sync.WaitGrou
 // two phase
 // 1. send file meta
 // 2. send file contents
-func Send(conn net.Conn, file *os.File, fullname string) {
+func Send(conn net.Conn, file *os.File, fullname string, compressed bool) {
     // get file information
     fi, err := file.Stat()
     if err != nil {
         log.Printf("Stat() %s failed: %s\n", file.Name(), err.Error())
         return
     }
+
+    if fi.IsDir() {
+        log.Printf("%s is a directory, not a file\n", fullname)
+        return
+    }
+
     size := fi.Size()
     mode := fi.Mode()
 
@@ -71,7 +83,11 @@ func Send(conn net.Conn, file *os.File, fullname string) {
     }
 
     meta := make([]byte, util.META_BUF_SIZE)
-    util.FormatMeta(meta, fullname, size, mode, md5, "yes", "zlib")
+    if compressed {
+        util.FormatMeta(meta, fullname, size, mode, md5, "yes", "zlib")
+    } else {
+        util.FormatMeta(meta, fullname, size, mode, md5, "no", "none")
+    }
 
     // sent meta info
     if _, err := conn.Write([]byte(meta)); err != nil {
@@ -79,34 +95,36 @@ func Send(conn net.Conn, file *os.File, fullname string) {
         return
     }
 
-    //log.Printf("meta has been sent\n%s", string(meta))
-
     // stop if server has sent response 
     interrupted := false
 
     var wg sync.WaitGroup
     wg.Add(1)
-    go ReceiveRespone(conn, fullname, &interrupted, &wg)
+    go ReceiveResponse(conn, fullname, &interrupted, &wg)
 
     // send file contents
     var sent int64 = 0
     buf := make([]byte, util.DATA_BUF_SIZE)
     hdr := make([]byte, util.DATA_HDR_SIZE)
 
-    cr := util.CompressReader(file)
-    fr := bufio.NewReader(cr)
-    defer cr.Close()
+    var fr *bufio.Reader
+
+    if compressed {
+        cr := util.CompressReader(file)
+        fr = bufio.NewReader(cr)
+        defer cr.Close()
+    } else {
+        fr = bufio.NewReader(file)
+    }
 
     for {
         if interrupted { break }
 
         rlen, err := fr.Read(buf)
-        // fmt.Printf(string(buf))
         if err == nil {
             if rlen > 0 {
                 // send header
                 util.FormatHeader(hdr, rlen)
-                //fmt.Printf("Sending header: %s\n", string(hdr))
                 hlen, e := conn.Write(hdr)
                 if e != nil || hlen != util.DATA_HDR_SIZE {
                     log.Printf("Write() failed: %s\n", e.Error())
@@ -119,12 +137,10 @@ func Send(conn net.Conn, file *os.File, fullname string) {
                     break
                 }
                 sent += int64(wlen)
-                //log.Printf("[%d, %d]--", wlen, sent)
             }
         } else if err == io.EOF {
             // send header, tell the server to stop
             util.FormatHeader(hdr, 0)
-            //fmt.Printf("Sending header: %s\n", string(hdr))
             hlen, e := conn.Write(hdr)
             if e != nil || hlen != util.DATA_HDR_SIZE {
                 log.Printf("Write() failed: %s\n", e.Error())
@@ -138,12 +154,17 @@ func Send(conn net.Conn, file *os.File, fullname string) {
     }
 
     if !interrupted {
-        log.Printf("%s: %d bytes, compressed: %d bytes, md5: %s\n",fullname, size, sent, md5)
+        if compressed {
+            log.Printf("%s: %d bytes, compressed to %d bytes, md5: %s\n",fullname, size, sent, md5)
+        } else {
+            log.Printf("%s: %d bytes, sent: %d bytes, md5: %s\n",fullname, size, sent, md5)
+        }
+
     }
     wg.Wait()
 }
 
-func SendFile(name string, host string, port int, wg *sync.WaitGroup) {
+func SendFile(name string, compressed bool, host string, port int, wg *sync.WaitGroup) {
     defer wg.Done()
 
     // open file
@@ -162,17 +183,23 @@ func SendFile(name string, host string, port int, wg *sync.WaitGroup) {
     }
     defer conn.Close()
 
-    Send(conn, file, name)
+    Send(conn, file, name, compressed)
 }
 
 func main() {
     var wg sync.WaitGroup
 
-    host, port, files := ParseParams()
+    host, port, help, compressed, files := ParseParams()
+
+    if help {
+        fmt.Printf("Usage: %s [-Hchp] file1 [file2 ...]\n", path.Base(os.Args[0]))
+        flag.PrintDefaults()
+        return
+    }
 
     for _, file := range files {
         wg.Add(1)
-        go SendFile(file, host, port, &wg)
+        go SendFile(file, compressed, host, port, &wg)
     }
 
     wg.Wait()

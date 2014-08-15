@@ -11,35 +11,26 @@ import (
 	"log"
 	"net"
 	"os"
+    "path"
     "errors"
 	"strconv"
     "./util"
 )
 
-const (
-	META_BUF_SIZE = 512
-	DATA_BUF_SIZE = 8192
-)
-
-func ParseParams() (port int, dst string) {
-	defaultDir := "current directory"
+func ParseParams() (port int, dst string, help bool) {
 	p := flag.Int("p", 12345, "listen port")
-	d := flag.String("d", defaultDir, "target direcotry to store received file(s)")
-
+	d := flag.String("d", ".", "target direcotry to store received file(s)")
+    h := flag.Bool("h", false, "print help information")
 	flag.Parse()
 
-	if *d == defaultDir {
-		return *p, "."
-	}
-
-	return *p, *d
+	return *p, *d, *h
 }
 
 func SendError(conn net.Conn, msg string, detail string) {
 	log.Printf("%s: %s\n", msg, detail)
 	_, err := conn.Write([]byte(fmt.Sprintf("error/server %s", msg)))
 	if err != nil {
-		log.Printf("send respone failed\n")
+		log.Printf("send response failed\n")
 		return
 	}
 }
@@ -47,7 +38,7 @@ func SendError(conn net.Conn, msg string, detail string) {
 func SendOk(conn net.Conn) {
 	_, err := conn.Write([]byte("ok/finished"))
 	if err != nil {
-		log.Printf("send respone failed\n")
+		log.Printf("send response failed\n")
 		return
 	}
 }
@@ -72,7 +63,7 @@ func Checksum(file *os.File, fullname string, size int64, md5 string, conn net.C
     }
 
 	if md5 == MD5 && MD5 != "nil" {
-        log.Printf("Receiving %s successed, md5: %s\n", fullname, md5)
+        log.Printf("Receiving %s successed, md5(%s) matched", fullname, md5)
 		SendOk(conn)
     } else if md5 != MD5 && md5 != "nil" && MD5 != "nil" {
 		log.Printf("Receiving %s failed\n", fullname)
@@ -85,7 +76,6 @@ func Checksum(file *os.File, fullname string, size int64, md5 string, conn net.C
 func ReceiveData(conn net.Conn, hdr, buf []byte) (int, error) {
     // read header
     hl, err := conn.Read(hdr)
-    //fmt.Printf("Receiving header: %s\n", string(hdr))
     if err != nil {
         return 0, err
     }
@@ -142,7 +132,7 @@ func HandleClient(conn net.Conn, dst string) {
 	}
 
 	if metalen != util.META_BUF_SIZE {
-		SendError(conn, "Wrong metadata", "must be a bug")
+		SendError(conn, "Read metadata failed", "client disconnect")
 		return
 	}
 
@@ -163,12 +153,15 @@ func HandleClient(conn net.Conn, dst string) {
 
     //log.Printf("received meta:\n%v", meta)
 
-    // decompress the received data stream and write to the target file
-    dw := util.DecompressWriter(file)
-	fw := bufio.NewWriter(dw)
-    defer dw.Close()
-
-    //fw := bufio.NewWriter(file)
+    var fw *bufio.Writer
+    if meta.Compressed == "yes" {
+        // decompress the received data stream and write to the target file
+        dw := util.DecompressWriter(file)
+        fw = bufio.NewWriter(dw)
+        defer dw.Close()
+    }  else {
+        fw = bufio.NewWriter(file)
+    }
 
 	// receive file contents
     var received int64 = 0
@@ -203,7 +196,23 @@ func HandleClient(conn net.Conn, dst string) {
 }
 
 func main() {
-	port, dst := ParseParams()
+	port, dst, help := ParseParams()
+
+    if help {
+        fmt.Printf("Usage: %s [-dhp]\n", path.Base(os.Args[0]))
+        flag.PrintDefaults()
+        return
+    }
+
+    fi, err := os.Stat(dst)
+    if err != nil {
+		log.Printf("Stat() failed: %s\n", err.Error())
+        return
+    }
+    if !fi.IsDir() {
+		log.Printf("%s is not a directory\n", err.Error())
+        return
+    }
 
 	ln, err := net.Listen("tcp", string(":"+strconv.Itoa(port)))
 	if err != nil {
