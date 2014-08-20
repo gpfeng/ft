@@ -96,7 +96,7 @@ func ReceiveData(conn net.Conn, hdr, buf []byte) (int, error) {
 			break
 		}
 		// read data
-		b := buf[start:left]
+		b := buf[start:start+left]
 		l, err := conn.Read(b)
 
 		if err != nil {
